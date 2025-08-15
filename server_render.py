@@ -329,9 +329,17 @@ def play():
         return jsonify(error=f"Spotify error {e.http_status}: {e.msg}"), int(e.http_status or 500)
     except Exception as e:
         return jsonify(error=f"Server error: {e}"), 500
+@app.get("/")
+def root():
+    return "ok", 200
+ 
+@app.get("/health")
+def health():
+    return "ok", 200
 
 # -----------------------------------------------------------------------------
 # Local dev (Render uses gunicorn)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5055")))
+
