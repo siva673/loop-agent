@@ -1,5 +1,5 @@
 # server_render.py
-# Loop Agent – cloud friendly Flask service for Spotify control
+# Loop Agent — cloud-friendly Flask service for Spotify control (fast version)
 
 import os
 import re
@@ -14,6 +14,7 @@ from flask import Flask, request, jsonify, redirect
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.exceptions import SpotifyException
 
 # -----------------------------------------------------------------------------
 # Config
@@ -25,21 +26,23 @@ SCOPES = (
     "playlist-read-private"
 )
 
-# Always use an ABSOLUTE, writable path on Render/Heroku/Docker for the token
+# Writable cache on Render/containers
 CACHE_PATH = os.getenv("OAUTH_CACHE_PATH", "/tmp/loop-agent-cache.json")
 DEFAULT_DEVICE_NAME = os.getenv("DEFAULT_DEVICE_NAME", "")
 
 # Flask
 app = Flask(__name__)
 
+# Serialize /play so back-to-back calls don't clash
+_play_lock = threading.Lock()
+
 # -----------------------------------------------------------------------------
-# Helpers: memoized auth + client
+# Auth (lazy + thread-safe)
 # -----------------------------------------------------------------------------
 _auth_lock = threading.Lock()
 _auth_obj: Optional[SpotifyOAuth] = None
 
 def auth() -> SpotifyOAuth:
-    """Create (once) and return a SpotifyOAuth that uses a stable cache path."""
     global _auth_obj
     with _auth_lock:
         if _auth_obj is None:
@@ -55,17 +58,17 @@ def auth() -> SpotifyOAuth:
         return _auth_obj
 
 def sp_client(ensure_auth: bool = True) -> spotipy.Spotify:
-    """Return an authenticated Spotify client or raise if not authorized."""
-    if ensure_auth:
-        token_info = auth().get_cached_token()
-        if not token_info:
-            raise PermissionError("Not authorized with Spotify. Visit /login first.")
-    return spotipy.Spotify(auth_manager=auth())
+    if ensure_auth and not auth().get_cached_token():
+        raise PermissionError("Not authorized with Spotify. Visit /login first.")
+    # spotipy requests timeout so the API doesn't hang
+    return spotipy.Spotify(auth_manager=auth(), requests_timeout=30)
 
 # -----------------------------------------------------------------------------
-# Time & command parsing
+# Command parsing & time handling
 # -----------------------------------------------------------------------------
 def parse_cmd(cmd: str) -> Tuple[List[str], Optional[str], Optional[str]]:
+    # Expected style:
+    #   play "Song A" "Song B" in loop till 10 minutes on iPhone
     titles = re.findall(r'"([^"]+)"', cmd)
     if not titles:
         raise ValueError('Use quotes: play "Song A" ["Song B"...] in loop till 10 minutes [on iPhone]')
@@ -95,21 +98,25 @@ def resolve_until_today(until_text: Optional[str]) -> datetime:
     return target
 
 # -----------------------------------------------------------------------------
-# Search & playlist utilities
+# Spotify helpers
 # -----------------------------------------------------------------------------
 def search_track(sp: spotipy.Spotify, query: str) -> Optional[str]:
+    # Try "track + optional artist" robustly; fall back to title-only
     title, artist = [s.strip() for s in (query.split(" - ") + [""])[:2]]
-    q = f'track:"{title}"' + (f' artist:"{artist}"' if artist else "")
-    res = sp.search(q=q, type="track", limit=1)
-    items = res.get("tracks", {}).get("items", [])
-    return items[0]["uri"] if items else None
+    primary = f'track:"{title}"' + (f' artist:"{artist}"' if artist else "")
+    for q in (primary, f'track:"{title}"'):
+        res = sp.search(q=q, type="track", limit=1)
+        items = res.get("tracks", {}).get("items", [])
+        if items:
+            return items[0]["uri"]
+    return None
 
 def search_tracks(sp: spotipy.Spotify, titles: List[str]) -> List[str]:
     uris: List[str] = []
     for t in titles:
         uri = search_track(sp, t)
         if not uri:
-            raise ValueError(f'Could not find: {t}. Try "Title - Artist".')
+            raise ValueError(f'Could not find: {t}. Try using just the title or correct "Title - Artist".')
         uris.append(uri)
     return uris
 
@@ -121,27 +128,21 @@ def create_session_playlist(sp: spotipy.Spotify, name_prefix="Loop Agent") -> st
     )
     return p["id"]
 
-def fill_playlist_and_wait(sp: spotipy.Spotify, pid: str, uris: List[str], repeats: int = 200) -> None:
-    total_expected = len(uris) * repeats
-    batch: List[str] = []
-    added = 0
-
-    for _ in range(repeats):
-        batch.extend(uris)
-        while len(batch) >= 100:
-            sp.playlist_add_items(pid, batch[:100])
-            added += 100
-            batch = batch[100:]
-    if batch:
-        sp.playlist_add_items(pid, batch)
-        added += len(batch)
-
-    deadline = time.time() + 15
+def fill_playlist_once(sp: spotipy.Spotify, pid: str, uris: List[str]) -> None:
+    # Add each URI once — we rely on repeat 'context' to loop infinitely
+    # (small playlist = faster/safer + no rate limits)
+    batch = uris[:]
+    while batch:
+        sp.playlist_add_items(pid, batch[:100])
+        batch = batch[100:]
+    # quick confirm (best-effort)
+    deadline = time.time() + 6
+    need = len(uris)
     while time.time() < deadline:
         pl = sp.playlist(pid, fields="tracks.total")
-        if pl and pl.get("tracks", {}).get("total", 0) >= total_expected:
+        if pl and pl.get("tracks", {}).get("total", 0) >= need:
             break
-        time.sleep(0.25)
+        time.sleep(0.2)
 
 def find_device(sp: spotipy.Spotify, preferred_name: Optional[str]) -> Tuple[Optional[str], list]:
     preferred_name = preferred_name or DEFAULT_DEVICE_NAME or None
@@ -182,59 +183,49 @@ def hard_start(sp: spotipy.Spotify, device_id: str, pl_uri: str) -> bool:
         sp.pause_playback(device_id=device_id)
     except Exception:
         pass
-
     try:
         sp.transfer_playback(device_id=device_id, force_play=True)
     except Exception:
         pass
-    time.sleep(0.7)
+    time.sleep(0.5)
 
     sp.start_playback(device_id=device_id, context_uri=pl_uri, offset={"position": 0})
-    time.sleep(1.0)
+    time.sleep(0.7)
 
     try:
         pb = sp.current_playback()
-        ctx = (pb or {}).get("context") or {}
-        ok = (ctx.get("uri") == pl_uri)
-
-        item = (pb or {}).get("item") or {}
-        prog = (pb or {}).get("progress_ms") or 0
-        if ok and prog > 2000 and item:
-            try:
-                sp.seek_track(0, device_id=device_id)
-            except Exception:
-                pass
-        return ok
+        ctx_uri = (pb or {}).get("context", {})..get("uri")
+        return ctx_uri == pl_uri
     except Exception:
         return False
 
 def start_loop_and_schedule_stop(sp: spotipy.Spotify, uris: List[str], end_at: datetime, device_id: str) -> None:
+    # 1) create tiny playlist
     pid = create_session_playlist(sp)
-    fill_playlist_and_wait(sp, pid, uris, repeats=200)
+    fill_playlist_once(sp, pid, uris)
     pl_uri = f"spotify:playlist:{pid}"
 
+    # 2) make sure device is usable
     if not ensure_device_active(sp, device_id):
         raise RuntimeError("Target device not active/visible on Spotify Connect.")
 
-    ok = hard_start(sp, device_id, pl_uri)
-    if not ok:
-        time.sleep(0.8)
-        ok = hard_start(sp, device_id, pl_uri)
-    if not ok:
-        raise RuntimeError("Could not switch playback to the session playlist.")
-
+    # 3) deterministic playback
     try:
-        pb = sp.current_playback()
-        dis = (pb or {}).get("actions", {}).get("disallows", {})
-        if not dis.get("toggling_shuffle"):
-            try: sp.shuffle(False, device_id=device_id)
-            except Exception: pass
-        if not dis.get("toggling_repeat_context"):
-            try: sp.repeat("context", device_id=device_id)
-            except Exception: pass
-    except Exception:
-        pass
+        # no shuffle; repeat the playlist (context)
+        try: sp.shuffle(False, device_id=device_id)
+        except Exception: pass
+        try: sp.repeat("context", device_id=device_id)
+        except Exception: pass
 
+        # 4) start and verify
+        if not hard_start(sp, device_id, pl_uri):
+            time.sleep(0.6)
+            if not hard_start(sp, device_id, pl_uri):
+                raise RuntimeError("Could not switch playback to the session playlist.")
+    except SpotifyException as e:
+        raise RuntimeError(f"Spotify error {e.http_status}: {e.msg}")
+
+    # 5) schedule stop
     def stopper():
         secs = (end_at - datetime.now(tz.tzlocal())).total_seconds()
         if secs > 0:
@@ -250,17 +241,16 @@ def start_loop_and_schedule_stop(sp: spotipy.Spotify, uris: List[str], end_at: d
 # -----------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return "Loop Agent is running. Visit /login to authorize, /healthz for ping.\n"
+    return "Loop Agent is running. Visit /login to authorize, /health for ping.\n"
 
-@app.get("/healthz")
-def healthz():
-    return "ok"
+@app.get("/health")
+def health():
+    return "ok", 200
 
 @app.get("/login")
 def login():
     try:
-        url = auth().get_authorize_url()
-        return redirect(url)
+        return redirect(auth().get_authorize_url())
     except Exception as e:
         return jsonify(error=f"Failed to start OAuth: {e}"), 500
 
@@ -270,7 +260,6 @@ def callback():
         code = request.args.get("code")
         if not code:
             return "OAuth callback missing 'code' parameter.", 400
-        # Exchange code and cache token to CACHE_PATH
         token_info = auth().get_access_token(code=code, as_dict=True)
         if not token_info:
             return "OAuth callback failed to obtain token.", 500
@@ -320,6 +309,8 @@ def status():
 
 @app.post("/play")
 def play():
+    # Body example:
+    # {"command": "play \"Kesariya\" \"Tum Hi Ho\" in loop till 20 minutes on iPhone"}
     try:
         data = request.get_json(force=True)
     except Exception:
@@ -340,14 +331,24 @@ def play():
         if not device_id:
             return jsonify(error="No active Spotify device found. Open Spotify on your phone/PC."), 409
 
-        start_loop_and_schedule_stop(sp, uris, end_at, device_id)
+        # prevent overlapping playlist builds / device transfers
+        with _play_lock:
+            start_loop_and_schedule_stop(sp, uris, end_at, device_id)
+
         return jsonify(status="playing", count=len(uris), stop_at=end_at.isoformat())
+
     except PermissionError as e:
         return jsonify(error=str(e)), 401
+    except ValueError as e:
+        # track not found or bad input
+        return jsonify(error=str(e)), 404
+    except SpotifyException as e:
+        return jsonify(error=f"Spotify error {e.http_status}: {e.msg}"), int(e.http_status or 500)
     except Exception as e:
-        return jsonify(error=str(e)), 500
+        return jsonify(error=f"Server error: {e}"), 500
 
 # -----------------------------------------------------------------------------
+# Local dev (Render uses gunicorn; this block is ignored in production)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Local dev: python server_render.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5055")))
