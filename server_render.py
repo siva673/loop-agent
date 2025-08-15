@@ -187,7 +187,7 @@ def hard_start(sp: spotipy.Spotify, device_id: str, pl_uri: str) -> bool:
     try:
         pb = sp.current_playback()
         ctx = (pb or {}).get("context") or {}
-        ctx_uri = ctx.get("uri")          # <- fixed line (no double dot)
+        ctx_uri = ctx.get("uri")
         return ctx_uri == pl_uri
     except Exception:
         return False
@@ -226,7 +226,7 @@ def start_loop_and_schedule_stop(sp: spotipy.Spotify, uris: List[str], end_at: d
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
-@app.get("/")
+@app.get("/")  # <-- only ONE root route exists now
 def root():
     return "Loop Agent is running. Visit /login to authorize, /health for ping.\n"
 
@@ -329,17 +329,9 @@ def play():
         return jsonify(error=f"Spotify error {e.http_status}: {e.msg}"), int(e.http_status or 500)
     except Exception as e:
         return jsonify(error=f"Server error: {e}"), 500
-@app.get("/")
-def root():
-    return "ok", 200
- 
-@app.get("/health")
-def health():
-    return "ok", 200
 
 # -----------------------------------------------------------------------------
 # Local dev (Render uses gunicorn)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5055")))
-
