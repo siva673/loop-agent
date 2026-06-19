@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+.cache-loop-agent
+*.json
+db.sqlite3
